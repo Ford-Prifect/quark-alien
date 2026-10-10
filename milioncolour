@@ -1,0 +1,244 @@
+
+ // ==UserScript==
+ // @name         Element Zap + Red Beam millioncolour
+ // @namespace    local
+ // @version      5.0
+ // @description  Select, connect, animate and remove elements
+ // @match        *://*/*
+ // @grant        none
+ // @run-at       document-idle
+ // ==/UserScript==
+
+ (() => {
+     'use strict';
+
+     let active = false;
+     let selected = null;
+     let previousOutline = '';
+     let keepAnimations = false;
+
+     let lastMouseX = window.innerWidth / 2;
+     let lastMouseY = window.innerHeight / 2;
+     let originX = lastMouseX;
+     let originY = lastMouseY;
+
+     const SVG_NS = 'http://www.w3.org/2000/svg';
+
+     document.addEventListener('mousemove', e => {
+         lastMouseX = e.clientX;
+         lastMouseY = e.clientY;
+     }, true);
+
+     document.addEventListener('keydown', e => {
+         if (!e.ctrlKey || e.altKey || e.metaKey) return;
+
+         const key = e.key.toLowerCase();
+
+         if (key === 'o') {
+             e.preventDefault();
+             e.stopPropagation();
+
+             if (!active) {
+                 originX = lastMouseX;
+                 originY = lastMouseY;
+                 active = true;
+             } else {
+                 active = false;
+                 clearHighlight();
+             }
+
+             document.documentElement.style.cursor =
+                 active ? 'crosshair' : '';
+
+         } else if (key === 'b') {
+             e.preventDefault();
+             e.stopPropagation();
+
+             keepAnimations = !keepAnimations;
+
+             console.log(
+                 'Keep animations:',
+                 keepAnimations ? 'ON' : 'OFF'
+             );
+         }
+     }, true);
+
+     function clearHighlight() {
+         if (selected && selected.isConnected) {
+             selected.style.outline = previousOutline;
+         }
+         selected = null;
+     }
+
+     document.addEventListener('mouseover', e => {
+         if (!active) return;
+
+         clearHighlight();
+
+         selected = e.target;
+         previousOutline = selected.style.outline;
+         selected.style.outline = '2px solid red';
+     }, true);
+
+     document.addEventListener('click', e => {
+         if (!active) return;
+
+         e.preventDefault();
+         e.stopImmediatePropagation();
+
+         const element = e.target;
+
+         clearHighlight();
+         active = false;
+         document.documentElement.style.cursor = '';
+
+         if (
+             !element ||
+             element === document.body ||
+             element === document.documentElement
+         ) return;
+
+         zap(element, originX, originY);
+     }, true);
+
+     function zap(element, startX, startY) {
+         const rect = element.getBoundingClientRect();
+
+         if (rect.width <= 0 || rect.height <= 0) {
+             element.remove();
+             return;
+         }
+
+         const x = rect.left;
+         const y = rect.top;
+         const w = rect.width;
+         const h = rect.height;
+
+         const cx = x + w / 2;
+         const cy = y + h / 2;
+
+         const svg = document.createElementNS(SVG_NS, 'svg');
+
+         Object.assign(svg.style, {
+             position: 'fixed',
+             left: '0',
+             top: '0',
+             width: '100vw',
+             height: '100vh',
+             overflow: 'visible',
+             pointerEvents: 'none',
+             zIndex: '2147483647',
+             margin: '0',
+             padding: '0'
+         });
+
+         svg.setAttribute(
+             'viewBox',
+             `0 0 ${window.innerWidth} ${window.innerHeight}`
+         );
+
+         document.body.appendChild(svg);
+
+         // Red beam
+         const line = document.createElementNS(SVG_NS, 'line');
+
+         line.setAttribute('x1', startX);
+         line.setAttribute('y1', startY);
+         line.setAttribute('x2', startX);
+         line.setAttribute('y2', startY);
+         line.setAttribute('stroke', 'red');
+         line.setAttribute('stroke-width', '3');
+         line.setAttribute('stroke-linecap', 'round');
+
+         svg.appendChild(line);
+
+         const beamDuration = 350;
+         const beamStart = performance.now();
+
+         function drawBeam(now) {
+             const progress = Math.min(
+                 (now - beamStart) / beamDuration, 1
+             );
+             const eased = 1 - Math.pow(1 - progress, 3);
+
+             line.setAttribute(
+                 'x2', startX + (cx - startX) * eased
+             );
+             line.setAttribute(
+                 'y2', startY + (cy - startY) * eased
+             );
+
+             if (progress < 1) {
+                 requestAnimationFrame(drawBeam);
+             } else {
+                 startZap();
+             }
+         }
+
+         function startZap() {
+             const stroke = 5;
+             const step = 5;
+
+             let inset = 0;
+             let hue = 0;
+             let frame = 0;
+
+             // Full rainbow cycle: 360 / 12 = 30 frames.
+             // Small elements still get all 30 colour steps.
+             const totalFrames = 30;
+
+             const timer = setInterval(() => {
+                 const rw = Math.max(0, w - inset * 2);
+                 const rh = Math.max(0, h - inset * 2);
+
+                 const r = document.createElementNS(
+                     SVG_NS, 'rect'
+                 );
+
+                 r.setAttribute('x', x + inset);
+                 r.setAttribute('y', y + inset);
+                 r.setAttribute('width', Math.max(rw, 0.1));
+                 r.setAttribute('height', Math.max(rh, 0.1));
+                 r.setAttribute('fill', 'none');
+                 r.setAttribute(
+                     'stroke',
+                     `hsl(${hue},100%,50%)`
+                 );
+                 r.setAttribute('stroke-width', stroke);
+
+                 svg.appendChild(r);
+
+                 hue = (hue + 12) % 360;
+                 inset += step;
+                 frame++;
+
+                 // Never end before the full colour cycle.
+                 // Continue drawing within the original element
+                 // bounds, even after the inset reaches its limit.
+                 if (inset * 2 >= Math.min(w, h)) {
+                     inset = 0;
+                 }
+
+                 if (frame >= totalFrames) {
+                     finish();
+                 }
+             }, 25);
+
+             let finished = false;
+
+             function finish() {
+                 if (finished) return;
+                 finished = true;
+
+                 clearInterval(timer);
+                 element.remove();
+
+                 if (!keepAnimations) {
+                     setTimeout(() => svg.remove(), 5000);
+                 }
+             }
+         }
+
+         requestAnimationFrame(drawBeam);
+     }
+ })();
