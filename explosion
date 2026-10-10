@@ -1,0 +1,315 @@
+
+// ==UserScript==
+// @name         Quark Alien - Rainbow Fan Explosion
+// @namespace    quark-alien
+// @version      1.0.0
+// @description  Ctrl+0 -> Element auswählen -> bunte Fächerexplosion
+// @match        *://*/*
+// @run-at       document-start
+// @grant        none
+// ==/UserScript==
+
+(() => {
+    'use strict';
+
+    let selecting = false;
+    let hovered = null;
+    let previousOutline = '';
+    let canvas = null;
+    let ctx = null;
+    let animationFrame = 0;
+
+    const STYLE_ID = 'quark-rainbow-explosion-style';
+
+    function installStyle() {
+        if (document.getElementById(STYLE_ID)) return;
+
+        const style = document.createElement('style');
+        style.id = STYLE_ID;
+        style.textContent = `
+            .quark-explosion-hover {
+                outline: 2px dashed #ff1744 !important;
+                outline-offset: 2px !important;
+                cursor: crosshair !important;
+            }
+
+            #quark-explosion-notice {
+                position: fixed !important;
+                top: 15px !important;
+                left: 50% !important;
+                transform: translateX(-50%) !important;
+                z-index: 2147483647 !important;
+                background: #171717 !important;
+                color: white !important;
+                padding: 10px 17px !important;
+                border: 2px solid #ff1744 !important;
+                border-radius: 5px !important;
+                font: 14px/1.4 monospace !important;
+                pointer-events: none !important;
+            }
+        `;
+        (document.head || document.documentElement).appendChild(style);
+    }
+
+    function showNotice(message) {
+        let notice = document.getElementById('quark-explosion-notice');
+
+        if (!notice) {
+            notice = document.createElement('div');
+            notice.id = 'quark-explosion-notice';
+            (document.body || document.documentElement).appendChild(notice);
+        }
+
+        notice.textContent = message;
+    }
+
+    function removeNotice() {
+        document.getElementById('quark-explosion-notice')?.remove();
+    }
+
+    function isEditable(element) {
+        return !!element?.closest(
+            'input, textarea, select, [contenteditable="true"]'
+        );
+    }
+
+    function isUsableTarget(element) {
+        return element &&
+            element !== document.documentElement &&
+            element !== document.body &&
+            !element.closest('#quark-explosion-notice') &&
+            !element.closest('script, style, link, meta');
+    }
+
+    function clearHover() {
+        if (hovered) {
+            hovered.classList.remove('quark-explosion-hover');
+            hovered.style.outline = previousOutline;
+        }
+        hovered = null;
+        previousOutline = '';
+    }
+
+    function beginSelection() {
+        installStyle();
+        selecting = true;
+        clearHover();
+
+        document.documentElement.style.cursor = 'crosshair';
+        showNotice('QUARK ALIEN // Klicke auf ein Element zum Zerstören');
+
+        document.addEventListener('mousemove', onMouseMove, true);
+        document.addEventListener('click', onSelectionClick, true);
+        document.addEventListener('keydown', onSelectionKey, true);
+    }
+
+    function endSelection() {
+        selecting = false;
+        clearHover();
+
+        document.documentElement.style.cursor = '';
+        removeNotice();
+
+        document.removeEventListener('mousemove', onMouseMove, true);
+        document.removeEventListener('click', onSelectionClick, true);
+        document.removeEventListener('keydown', onSelectionKey, true);
+    }
+
+    function onMouseMove(event) {
+        if (!selecting) return;
+
+        const element = document.elementFromPoint(event.clientX, event.clientY);
+
+        if (!isUsableTarget(element) || element === hovered) return;
+
+        clearHover();
+        hovered = element;
+        previousOutline = hovered.style.outline;
+        hovered.classList.add('quark-explosion-hover');
+    }
+
+    function onSelectionClick(event) {
+        if (!selecting) return;
+
+        const target = document.elementFromPoint(event.clientX, event.clientY);
+
+        if (!isUsableTarget(target)) return;
+
+        event.preventDefault();
+        event.stopPropagation();
+        event.stopImmediatePropagation();
+
+        const rect = target.getBoundingClientRect();
+
+        // Keine Explosion für unsichtbare Elemente.
+        if (rect.width < 2 || rect.height < 2) {
+            endSelection();
+            return;
+        }
+
+        endSelection();
+        explode(target, rect);
+    }
+
+    function onSelectionKey(event) {
+        if (event.key === 'Escape') {
+            event.preventDefault();
+            endSelection();
+        }
+    }
+
+    function createCanvas() {
+        if (canvas) canvas.remove();
+
+        canvas = document.createElement('canvas');
+        canvas.id = 'quark-explosion-canvas';
+
+        Object.assign(canvas.style, {
+            position: 'fixed',
+            inset: '0',
+            width: '100vw',
+            height: '100vh',
+            zIndex: '2147483646',
+            pointerEvents: 'none'
+        });
+
+        document.documentElement.appendChild(canvas);
+
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        canvas.width = Math.round(window.innerWidth * dpr);
+        canvas.height = Math.round(window.innerHeight * dpr);
+
+        ctx = canvas.getContext('2d');
+        ctx.scale(dpr, dpr);
+    }
+
+    function random(min, max) {
+        return min + Math.random() * (max - min);
+    }
+
+    function makeRay(originX, originY, index, count) {
+        // Fächer von links nach rechts über die obere Halbebene.
+        const spread = Math.PI;
+        const angle = Math.PI + (index / (count - 1)) * spread
+            + random(-0.012, 0.012);
+
+        return {
+            angle,
+            length: random(70, Math.max(150, Math.min(430, window.innerHeight * 0.8))),
+            width: random(0.45, 1.45),
+            hue: random(0, 360),
+            startOffset: random(0, 16),
+            phase: random(0, 0.12),
+            originX,
+            originY
+        };
+    }
+
+    function explode(element, rect) {
+        cancelAnimationFrame(animationFrame);
+        createCanvas();
+
+        const originX = rect.left + rect.width / 2;
+        const originY = rect.bottom;
+
+        // Das ausgewählte Element verschwindet beim Explosionsstart.
+        const oldVisibility = element.style.visibility;
+        element.style.visibility = 'hidden';
+
+        const rayCount = Math.min(
+            420,
+            Math.max(220, Math.round(window.innerWidth * 0.38))
+        );
+
+        const rays = Array.from(
+            { length: rayCount },
+            (_, i) => makeRay(originX, originY, i, rayCount)
+        );
+
+        const duration = 1700;
+        const startTime = performance.now();
+
+        function draw(now) {
+            if (!ctx || !canvas) return;
+
+            const elapsed = now - startTime;
+            const progress = Math.min(elapsed / duration, 1);
+
+            ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
+
+            for (const ray of rays) {
+                const local = Math.max(
+                    0,
+                    Math.min(1, (progress - ray.phase) / (1 - ray.phase))
+                );
+
+                // Schneller Vorstoß, danach langsames Ausblenden.
+                const growth = 1 - Math.pow(1 - local, 2.4);
+                const fade = Math.pow(1 - progress, 0.85);
+
+                if (fade <= 0) continue;
+
+                const startX = ray.originX +
+                    Math.cos(ray.angle) * ray.startOffset;
+                const startY = ray.originY +
+                    Math.sin(ray.angle) * ray.startOffset;
+
+                const distance = ray.length * growth;
+                const endX = startX + Math.cos(ray.angle) * distance;
+                const endY = startY + Math.sin(ray.angle) * distance;
+
+                ctx.beginPath();
+                ctx.moveTo(startX, startY);
+                ctx.lineTo(endX, endY);
+
+                ctx.strokeStyle =
+                    `hsla(${ray.hue},100%,50%,${fade})`;
+                ctx.lineWidth = ray.width;
+                ctx.lineCap = 'round';
+                ctx.stroke();
+            }
+
+            if (progress < 1) {
+                animationFrame = requestAnimationFrame(draw);
+            } else {
+                canvas?.remove();
+                canvas = null;
+                ctx = null;
+
+                // Element bleibt zerstört/unsichtbar.
+                // Bei Bedarf kannst du hier oldVisibility wiederherstellen.
+            }
+        }
+
+        animationFrame = requestAnimationFrame(draw);
+    }
+
+    // Ctrl+0 startet den Auswahlmodus.
+    document.addEventListener('keydown', event => {
+        if (
+            event.ctrlKey &&
+            !event.altKey &&
+            !event.metaKey &&
+            event.key === '0'
+        ) {
+            event.preventDefault();
+            event.stopPropagation();
+            event.stopImmediatePropagation();
+
+            if (selecting) {
+                endSelection();
+            } else {
+                beginSelection();
+            }
+        }
+    }, true);
+
+    // Falls die Seite noch lädt, wird das Stylesheet später ergänzt.
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', installStyle, {
+            once: true
+        });
+    } else {
+        installStyle();
+    }
+})();
