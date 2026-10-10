@@ -1,0 +1,1009 @@
+
+// ==UserScript==
+// @name         Quark Alien 
+// @namespace    local
+// @version      4.0.0
+// @description  Alien shot, selectable targets, red beams and rainbow zap
+// @match        *://*/*
+// @grant        GM_addStyle
+// @run-at       document-idle
+// ==/UserScript==
+
+(() => {
+    'use strict';
+
+    if (window.__quarkAlienZapInitialized) return;
+    window.__quarkAlienZapInitialized = true;
+
+    // ==================================================
+    // CONFIGURATION — CHANGE THESE VALUES
+    // ==================================================
+
+    const CONFIG = {
+        // Alien movement
+        walkSpeed: 150,
+        verticalSpeed: 25,
+        walkDuration: 10,
+        entrySoundLead: 2,
+        walkFrameMs: 100,
+
+        // Shooting sprite frames
+        shootStartFrame: 15,
+        shootEndFrame: 19,
+        shootFrameMs: 150,
+        shotSoundStartFrame: 0,
+
+        // Sprite
+        alienSize: 64,
+        spriteWidth: 64,
+
+        // Audio
+        walkVolume: 0.30,
+        shotVolume: 0.45,
+        stepSoundInterval: 500,
+
+        // Element selection
+        defaultTargetCount: 3,
+        maxTargets: 30,
+        shortcutSequenceMs: 1500,
+
+        // Red beam
+        beamDuration: 350,
+        beamWidth: 3,
+
+        // Rainbow zap
+        zapDuration: 5000,       // Animation lasts about 5 seconds
+        zapFrameInterval: 25,
+        zapHueStep: 12,
+        zapStrokeWidth: 5,
+        zapInsetStep: 5,
+
+        // Keep the completed SVG visible this long after the zap.
+        removeEffectsAfter: 5000,
+
+        // Keyboard adjustments
+        speedIncrease: 50,
+        durationIncrease: 5
+    };
+
+    const WALK_SOUND =
+        'https://github.com/Ford-Prifect/quark-alien/raw/refs/heads/main/alienrun2.wav';
+
+    const SHOT_SOUND =
+        'https://github.com/Ford-Prifect/quark-alien/raw/refs/heads/Ford-Prifect-patch-1/AlienSchie%C3%9Ft.wav';
+
+    const SPRITE_URL =
+        'https://i.imgur.com/U02Ectc.png';
+
+    const SVG_NS = 'http://www.w3.org/2000/svg';
+
+    GM_addStyle(`
+        #qa-overlay {
+            position: fixed !important;
+            inset: 0 !important;
+            width: 100vw !important;
+            height: 100vh !important;
+            overflow: hidden !important;
+            pointer-events: none !important;
+            z-index: 2147483645 !important;
+        }
+
+        #qa-alien {
+            position: absolute !important;
+            width: ${CONFIG.alienSize}px !important;
+            height: ${CONFIG.alienSize}px !important;
+            background-image: url("${SPRITE_URL}") !important;
+            background-repeat: no-repeat !important;
+            image-rendering: pixelated !important;
+            transform-origin: center;
+            will-change: left, top, background-position;
+        }
+
+        #qa-zap-svg {
+            position: fixed !important;
+            inset: 0 !important;
+            width: 100vw !important;
+            height: 100vh !important;
+            overflow: visible !important;
+            pointer-events: none !important;
+            z-index: 2147483647 !important;
+            margin: 0 !important;
+            padding: 0 !important;
+        }
+
+        #qa-status {
+            position: fixed !important;
+            left: 12px !important;
+            bottom: 12px !important;
+            z-index: 2147483647 !important;
+            background: rgba(0,0,0,.85) !important;
+            color: white !important;
+            padding: 8px 12px !important;
+            font: 13px monospace !important;
+            border-radius: 5px !important;
+            pointer-events: none !important;
+        }
+    `);
+
+    // ==================================================
+    // STATE
+    // ==================================================
+
+    let alien = null;
+    let overlay = null;
+    let active = false;
+    let state = 'dead';
+    let hasShot = false;
+    let shotSoundStarted = false;
+
+    let x = 0;
+    let y = 0;
+    let vx = 0;
+    let vy = 0;
+    let frame = 0;
+
+    let stateStarted = 0;
+    let lastFrameAt = 0;
+    let lastMoveAt = 0;
+    let lastStepAt = 0;
+
+    let currentSpeed = CONFIG.walkSpeed;
+    let currentDuration = CONFIG.walkDuration;
+
+    let targetMode = false;
+    let targetX = 0;
+    let targetY = 0;
+
+    let mouseX = innerWidth / 2;
+    let mouseY = innerHeight / 2;
+
+    let targets = [];
+    let shotOrigins = [];
+
+    let selectionActive = false;
+    let multiMode = false;
+    let requestedTargets = 1;
+    let hoverElement = null;
+    let hoverOutline = '';
+
+    let keepAnimations = false;
+    let sequenceState = '';
+    let sequenceTimer = null;
+    let selectionTimer = null;
+
+    let spawnTimeout = null;
+    let animationFrame = null;
+    let generation = 0;
+
+    const walkSounds = Array.from({ length: 5 }, () => {
+        const audio = new Audio(WALK_SOUND);
+        audio.preload = 'auto';
+        audio.volume = CONFIG.walkVolume;
+        return audio;
+    });
+
+    const shotAudio = new Audio(SHOT_SOUND);
+    shotAudio.preload = 'auto';
+    shotAudio.volume = CONFIG.shotVolume;
+
+    function clamp(value, min, max) {
+        return Math.max(min, Math.min(value, max));
+    }
+
+    function stopAudio(audio) {
+        audio.pause();
+        try {
+            audio.currentTime = 0;
+        } catch (_) {}
+    }
+
+    function stopWalkSounds() {
+        walkSounds.forEach(stopAudio);
+    }
+
+    function stopAllSounds() {
+        stopWalkSounds();
+        stopAudio(shotAudio);
+    }
+
+    function playWalkSound() {
+        const now = performance.now();
+
+        if (now - lastStepAt < CONFIG.stepSoundInterval) return;
+        lastStepAt = now;
+
+        const audio = walkSounds.shift();
+        walkSounds.push(audio);
+
+        stopAudio(audio);
+        audio.play().catch(() => {});
+    }
+
+    function playShotSound() {
+        if (shotSoundStarted) return;
+        shotSoundStarted = true;
+
+        stopWalkSounds();
+
+        try {
+            shotAudio.currentTime = 0;
+            shotAudio.play().catch(() => {});
+        } catch (_) {}
+    }
+
+    // ==================================================
+    // MOUSE + STATUS
+    // ==================================================
+
+    document.addEventListener('mousemove', event => {
+        mouseX = event.clientX;
+        mouseY = event.clientY;
+    }, true);
+
+    function showStatus(message) {
+        let el = document.getElementById('qa-status');
+
+        if (!el) {
+            el = document.createElement('div');
+            el.id = 'qa-status';
+            document.documentElement.appendChild(el);
+        }
+
+        el.textContent = message;
+    }
+
+    function hideStatus() {
+        document.getElementById('qa-status')?.remove();
+    }
+
+    // ==================================================
+    // KEYBOARD SEQUENCE
+    // ==================================================
+
+    function clearSequenceTimer() {
+        clearTimeout(sequenceTimer);
+        sequenceTimer = null;
+        sequenceState = '';
+    }
+
+    function armSequence(stateName) {
+        clearTimeout(sequenceTimer);
+        sequenceState = stateName;
+
+        sequenceTimer = setTimeout(() => {
+            const oldState = sequenceState;
+            sequenceState = '';
+            sequenceTimer = null;
+
+            if (oldState === 'multi') {
+                beginSelection(true, CONFIG.defaultTargetCount);
+            } else if (oldState === 'number') {
+                beginSelection(true, requestedTargets);
+            } else if (oldState === 'normal') {
+                beginSelection(false, 1);
+            }
+        }, CONFIG.shortcutSequenceMs);
+    }
+
+    function beginSelection(isMulti, count) {
+        if (active || selectionActive) return;
+
+        multiMode = isMulti;
+        requestedTargets = clamp(
+            Math.floor(count),
+            1,
+            CONFIG.maxTargets
+        );
+
+        targets = [];
+        selectionActive = true;
+
+        document.documentElement.style.cursor = 'crosshair';
+
+        showStatus(
+            isMulti
+                ? `MULTI-ZAP: select ${requestedTargets} elements`
+                : 'ALIEN ZAP: select 1 element'
+        );
+    }
+
+    document.addEventListener('keydown', event => {
+        if (!event.ctrlKey || event.altKey || event.metaKey) return;
+
+        const key = event.key.toLowerCase();
+
+        if (key === 'k') {
+            event.preventDefault();
+            event.stopPropagation();
+
+            if (active || selectionActive) {
+                cancelSelection();
+                return;
+            }
+
+            // Ctrl+K starts normal selection after the sequence
+            // window, allowing Ctrl+K, R, [number].
+            armSequence('normal');
+            showStatus('Ctrl+K: select target | R: multi-zap');
+            return;
+        }
+
+        if (sequenceState === 'normal' && key === 'r') {
+            event.preventDefault();
+            event.stopPropagation();
+
+            armSequence('multi');
+            showStatus(
+                `MULTI-ZAP: default ${CONFIG.defaultTargetCount}; type a number`
+            );
+            return;
+        }
+
+        if (
+            (sequenceState === 'multi' || sequenceState === 'number') &&
+            /^[0-9]$/.test(key)
+        ) {
+            event.preventDefault();
+            event.stopPropagation();
+
+            const digit = Number(key);
+
+            if (sequenceState === 'multi') {
+                requestedTargets = digit === 0
+                    ? CONFIG.defaultTargetCount
+                    : digit;
+            } else {
+                requestedTargets = clamp(
+                    requestedTargets * 10 + digit,
+                    1,
+                    CONFIG.maxTargets
+                );
+            }
+
+            sequenceState = 'number';
+
+            clearTimeout(sequenceTimer);
+            sequenceTimer = setTimeout(() => {
+                sequenceState = '';
+                sequenceTimer = null;
+                beginSelection(true, requestedTargets);
+            }, CONFIG.shortcutSequenceMs);
+
+            showStatus(`MULTI-ZAP: ${requestedTargets} target(s)`);
+            return;
+        }
+
+        if (key === 'b') {
+            event.preventDefault();
+            keepAnimations = !keepAnimations;
+
+            console.log(
+                '[Quark Alien] Keep animations:',
+                keepAnimations ? 'ON' : 'OFF'
+            );
+            return;
+        }
+
+        // Optional adjustment shortcuts: Ctrl+K, F or Ctrl+K, S.
+        if (sequenceState === 'normal' && key === 'f') {
+            event.preventDefault();
+            clearSequenceTimer();
+            currentSpeed += CONFIG.speedIncrease;
+            console.log('Alien speed:', currentSpeed);
+            return;
+        }
+
+        if (sequenceState === 'normal' && key === 's') {
+            event.preventDefault();
+            clearSequenceTimer();
+            currentDuration += CONFIG.durationIncrease;
+            console.log('Walk duration:', currentDuration);
+        }
+    }, true);
+
+    function cancelSelection() {
+        selectionActive = false;
+        clearSequenceTimer();
+        clearTimeout(selectionTimer);
+
+        clearHover();
+
+        document.documentElement.style.cursor = '';
+        hideStatus();
+    }
+
+    // ==================================================
+    // ELEMENT SELECTION
+    // ==================================================
+
+    function clearHover() {
+        if (hoverElement?.isConnected) {
+            hoverElement.style.outline = hoverOutline;
+        }
+
+        hoverElement = null;
+    }
+
+    document.addEventListener('mouseover', event => {
+        if (!selectionActive) return;
+
+        clearHover();
+
+        const element = event.target;
+
+        if (!(element instanceof Element)) return;
+        if (element.id === 'qa-status') return;
+        if (element.closest('#qa-overlay, #qa-zap-svg')) return;
+
+        hoverElement = element;
+        hoverOutline = element.style.outline;
+        element.style.outline = '2px solid red';
+    }, true);
+
+    document.addEventListener('click', event => {
+        if (!selectionActive) return;
+
+        event.preventDefault();
+        event.stopImmediatePropagation();
+
+        const element = event.target;
+
+        if (!(element instanceof Element)) return;
+        if (
+            element === document.body ||
+            element === document.documentElement ||
+            element.id === 'qa-status' ||
+            element.closest('#qa-overlay, #qa-zap-svg')
+        ) return;
+
+        if (targets.includes(element)) {
+            showStatus('That element is already selected.');
+            return;
+        }
+
+        clearHover();
+        targets.push(element);
+
+        if (targets.length < requestedTargets) {
+            showStatus(
+                `Selected ${targets.length}/${requestedTargets} elements`
+            );
+            return;
+        }
+
+        selectionActive = false;
+        document.documentElement.style.cursor = '';
+        hideStatus();
+
+        // Start the alien only after all targets have been chosen.
+        spawnAlien();
+    }, true);
+
+    // ==================================================
+    // SPAWN ALIEN
+    // ==================================================
+
+    function spawnAlien() {
+        if (active) return;
+
+        active = true;
+        hasShot = false;
+        shotSoundStarted = false;
+        shotOrigins = [];
+
+        generation++;
+        const myGeneration = generation;
+
+        clearTimeout(spawnTimeout);
+
+        if (animationFrame !== null) {
+            cancelAnimationFrame(animationFrame);
+        }
+
+        overlay?.remove();
+        stopAllSounds();
+
+        state = 'preparing';
+        frame = 0;
+
+        playWalkSound();
+
+        spawnTimeout = setTimeout(() => {
+            if (!active || generation !== myGeneration) return;
+            createAlien();
+        }, CONFIG.entrySoundLead * 1000);
+    }
+
+    function createAlien() {
+        overlay = document.createElement('div');
+        overlay.id = 'qa-overlay';
+
+        alien = document.createElement('div');
+        alien.id = 'qa-alien';
+
+        overlay.appendChild(alien);
+        document.documentElement.appendChild(overlay);
+
+        const width = innerWidth;
+        const height = innerHeight;
+        const size = CONFIG.alienSize;
+        const fromLeft = Math.random() < 0.5;
+
+        x = fromLeft ? -size : width;
+        y = Math.random() * Math.max(1, height - size);
+
+        vx = fromLeft ? currentSpeed : -currentSpeed;
+        vy = (Math.random() < 0.5 ? 1 : -1) *
+            CONFIG.verticalSpeed;
+
+        state = 'enter';
+        stateStarted = performance.now();
+        lastMoveAt = stateStarted;
+        lastFrameAt = stateStarted;
+
+        render();
+        animationFrame = requestAnimationFrame(loop);
+    }
+
+    // ==================================================
+    // MOVEMENT + RENDER
+    // ==================================================
+
+    function moveAlien(now) {
+        const width = innerWidth;
+        const height = innerHeight;
+        const size = CONFIG.alienSize;
+
+        const dt = Math.min(
+            Math.max((now - lastMoveAt) / 1000, 0),
+            0.05
+        );
+
+        lastMoveAt = now;
+
+        x += vx * dt;
+        y += vy * dt;
+
+        if (y <= 0) {
+            y = 0;
+            vy = Math.abs(vy);
+        }
+
+        if (y >= height - size) {
+            y = height - size;
+            vy = -Math.abs(vy);
+        }
+
+        if (state === 'enter') {
+            if (
+                (vx > 0 && x >= 0) ||
+                (vx < 0 && x <= width - size)
+            ) {
+                x = clamp(x, 0, width - size);
+                state = 'walk';
+                stateStarted = now;
+            }
+            return;
+        }
+
+        if (x <= 0) {
+            x = 0;
+            vx = Math.abs(currentSpeed);
+        }
+
+        if (x >= width - size) {
+            x = width - size;
+            vx = -Math.abs(currentSpeed);
+        }
+    }
+
+    function render() {
+        if (!alien) return;
+
+        alien.style.backgroundPosition =
+            `-${frame * CONFIG.spriteWidth}px 0`;
+
+        alien.style.transform =
+            vx >= 0 ? 'scaleX(1)' : 'scaleX(-1)';
+
+        alien.style.left = `${x}px`;
+        alien.style.top = `${y}px`;
+    }
+
+    // ==================================================
+    // SHOT ORIGINS
+    // ==================================================
+
+    function captureShotOrigins() {
+        const rect = alien?.getBoundingClientRect();
+
+        if (!rect) return;
+
+        const cx = rect.left + rect.width / 2;
+
+        // Three distinct origins on the firing sprite:
+        // upper-middle, centre, lower-middle.
+        shotOrigins = [
+            { x: cx, y: rect.top + rect.height * 0.20 },
+            { x: cx, y: rect.top + rect.height * 0.50 },
+            { x: cx, y: rect.top + rect.height * 0.80 }
+        ];
+    }
+
+    // ==================================================
+    // ALIEN ANIMATION LOOP
+    // ==================================================
+
+    function loop() {
+        if (!active || !alien) return;
+
+        const now = performance.now();
+
+        if (state === 'enter' || state === 'walk') {
+            moveAlien(now);
+
+            if (now - lastFrameAt >= CONFIG.walkFrameMs) {
+                frame++;
+
+                if (frame > 14) frame = 0;
+
+                lastFrameAt = now;
+            }
+
+            if (state === 'walk') {
+                playWalkSound();
+
+                if (now - stateStarted >= currentDuration * 1000) {
+                    state = 'shoot';
+                    stateStarted = now;
+                    lastFrameAt = now;
+                    hasShot = true;
+                    frame = CONFIG.shootStartFrame;
+
+                    captureShotOrigins();
+
+                    if (CONFIG.shotSoundStartFrame <= 0) {
+                        playShotSound();
+                    }
+                }
+            }
+        } else if (state === 'shoot') {
+            const elapsed = now - stateStarted;
+            const offset = Math.floor(
+                elapsed / CONFIG.shootFrameMs
+            );
+
+            const frameCount =
+                CONFIG.shootEndFrame -
+                CONFIG.shootStartFrame + 1;
+
+            frame = Math.min(
+                CONFIG.shootStartFrame + offset,
+                CONFIG.shootEndFrame
+            );
+
+            if (
+                !shotSoundStarted &&
+                offset >= CONFIG.shotSoundStartFrame
+            ) {
+                playShotSound();
+            }
+
+            if (offset >= frameCount) {
+                frame = CONFIG.shootEndFrame;
+                state = 'waitForSound';
+                stateStarted = now;
+            }
+        } else if (state === 'waitForSound') {
+            frame = CONFIG.shootEndFrame;
+
+            if (
+                shotAudio.ended ||
+                !shotSoundStarted ||
+                shotAudio.error ||
+                (shotAudio.paused && shotAudio.currentTime === 0)
+            ) {
+                finishShot();
+                return;
+            }
+        }
+
+        render();
+        animationFrame = requestAnimationFrame(loop);
+    }
+
+    shotAudio.addEventListener('ended', () => {
+        if (active && state === 'waitForSound') {
+            finishShot();
+        }
+    });
+
+    function finishShot() {
+        if (!active || state !== 'waitForSound') return;
+
+        state = 'zap';
+
+        overlay?.remove();
+        overlay = null;
+        alien = null;
+
+        active = false;
+        stopAllSounds();
+
+        startMultiZap(targets.slice(), shotOrigins.slice());
+    }
+
+    // ==================================================
+    // RED BEAMS + RAINBOW ZAP
+    // ==================================================
+
+    function createSVG() {
+        const svg = document.createElementNS(SVG_NS, 'svg');
+        svg.id = 'qa-zap-svg';
+
+        svg.setAttribute(
+            'viewBox',
+            `0 0 ${innerWidth} ${innerHeight}`
+        );
+
+        document.documentElement.appendChild(svg);
+        return svg;
+    }
+
+    function startMultiZap(elements, origins) {
+        const validTargets = elements.filter(element =>
+            element?.isConnected &&
+            element.getBoundingClientRect().width > 0 &&
+            element.getBoundingClientRect().height > 0
+        );
+
+        if (!validTargets.length || !origins.length) {
+            targets = [];
+            state = 'dead';
+            return;
+        }
+
+        const svg = createSVG();
+        const jobs = [];
+
+        validTargets.forEach((element, index) => {
+            const rect = element.getBoundingClientRect();
+
+            const origin = origins[index % origins.length];
+
+            const target = {
+                element,
+                x: rect.left,
+                y: rect.top,
+                w: rect.width,
+                h: rect.height,
+                cx: rect.left + rect.width / 2,
+                cy: rect.top + rect.height / 2
+            };
+
+            const line = document.createElementNS(SVG_NS, 'line');
+
+            line.setAttribute('x1', origin.x);
+            line.setAttribute('y1', origin.y);
+            line.setAttribute('x2', origin.x);
+            line.setAttribute('y2', origin.y);
+            line.setAttribute('stroke', 'red');
+            line.setAttribute('stroke-width', CONFIG.beamWidth);
+            line.setAttribute('stroke-linecap', 'round');
+
+            svg.appendChild(line);
+
+            jobs.push({ origin, target, line });
+        });
+
+        const beamStart = performance.now();
+
+        function drawBeams(now) {
+            const progress = Math.min(
+                (now - beamStart) / CONFIG.beamDuration,
+                1
+            );
+
+            const eased = 1 - Math.pow(1 - progress, 3);
+
+            jobs.forEach(({ origin, target, line }) => {
+                line.setAttribute(
+                    'x2',
+                    origin.x + (target.cx - origin.x) * eased
+                );
+
+                line.setAttribute(
+                    'y2',
+                    origin.y + (target.cy - origin.y) * eased
+                );
+            });
+
+            if (progress < 1) {
+                requestAnimationFrame(drawBeams);
+            } else {
+                jobs.forEach(({ target, line }) => {
+                    line.remove();
+                    startRainbowZap(svg, target);
+                });
+            }
+        }
+
+        requestAnimationFrame(drawBeams);
+    }
+
+    function startRainbowZap(svg, target) {
+        const start = performance.now();
+        const totalFrames = Math.max(
+            1,
+            Math.ceil(CONFIG.zapDuration / CONFIG.zapFrameInterval)
+        );
+
+        let frameNumber = 0;
+        let inset = 0;
+        let hue = 0;
+
+        function animate(now) {
+            if (!svg.isConnected) return;
+
+            const elapsed = now - start;
+            const progress = Math.min(
+                elapsed / CONFIG.zapDuration,
+                1
+            );
+
+            // Keep the entire rainbow animation running for
+            // the configured duration, including small elements.
+            const rectNode =
+                document.createElementNS(SVG_NS, 'rect');
+
+            const maxInset = Math.min(
+                target.w,
+                target.h
+            ) / 2;
+
+            const actualInset = maxInset > 0
+                ? inset % Math.max(1, maxInset)
+                : 0;
+
+            rectNode.setAttribute(
+                'x',
+                target.x + actualInset
+            );
+            rectNode.setAttribute(
+                'y',
+                target.y + actualInset
+            );
+            rectNode.setAttribute(
+                'width',
+                Math.max(0.1, target.w - actualInset * 2)
+            );
+            rectNode.setAttribute(
+                'height',
+                Math.max(0.1, target.h - actualInset * 2)
+            );
+            rectNode.setAttribute('fill', 'none');
+            rectNode.setAttribute(
+                'stroke',
+                `hsl(${hue},100%,50%)`
+            );
+            rectNode.setAttribute(
+                'stroke-width',
+                CONFIG.zapStrokeWidth
+            );
+
+            svg.appendChild(rectNode);
+
+            hue = (hue + CONFIG.zapHueStep) % 360;
+            inset += CONFIG.zapInsetStep;
+            frameNumber++;
+
+            if (
+                frameNumber < totalFrames &&
+                progress < 1
+            ) {
+                setTimeout(() => {
+                    requestAnimationFrame(animate);
+                }, CONFIG.zapFrameInterval);
+                return;
+            }
+
+            // Remove the target only after the full animation.
+            target.element.remove();
+
+            if (!keepAnimations) {
+                setTimeout(() => svg.remove(),
+                    CONFIG.removeEffectsAfter);
+            }
+
+            targets = targets.filter(
+                element => element !== target.element
+            );
+        }
+
+        requestAnimationFrame(animate);
+    }
+
+    // ==================================================
+    // CTRL+O — OPTIONAL DIRECT ZAP MODE
+    // ==================================================
+
+    let directZapActive = false;
+    let directOriginX = mouseX;
+    let directOriginY = mouseY;
+
+    document.addEventListener('keydown', event => {
+        if (
+            !event.ctrlKey ||
+            event.altKey ||
+            event.metaKey ||
+            event.key.toLowerCase() !== 'o'
+        ) return;
+
+        event.preventDefault();
+        event.stopPropagation();
+
+        if (selectionActive || active) return;
+
+        directZapActive = !directZapActive;
+
+        if (directZapActive) {
+            directOriginX = mouseX;
+            directOriginY = mouseY;
+            document.documentElement.style.cursor = 'crosshair';
+            showStatus('Direct zap: click an element');
+        } else {
+            document.documentElement.style.cursor = '';
+            hideStatus();
+            clearHover();
+        }
+    }, true);
+
+    document.addEventListener('mouseover', event => {
+        if (!directZapActive || selectionActive) return;
+
+        clearHover();
+
+        const element = event.target;
+
+        if (!(element instanceof Element)) return;
+        if (element.closest('#qa-overlay, #qa-zap-svg, #qa-status')) return;
+
+        hoverElement = element;
+        hoverOutline = element.style.outline;
+        element.style.outline = '2px solid red';
+    }, true);
+
+    document.addEventListener('click', event => {
+        if (!directZapActive || selectionActive) return;
+
+        event.preventDefault();
+        event.stopImmediatePropagation();
+
+        const element = event.target;
+
+        if (!(element instanceof Element)) return;
+        if (
+            element === document.body ||
+            element === document.documentElement ||
+            element.closest('#qa-overlay, #qa-zap-svg, #qa-status')
+        ) return;
+
+        clearHover();
+        directZapActive = false;
+        document.documentElement.style.cursor = '';
+        hideStatus();
+
+        const rect = element.getBoundingClientRect();
+
+        if (rect.width <= 0 || rect.height <= 0) {
+            element.remove();
+            return;
+        }
+
+        startMultiZap(
+            [element],
+            [{ x: directOriginX, y: directOriginY }]
+        );
+    }, true);
+
+})();
