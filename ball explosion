@@ -1,0 +1,396 @@
+
+ // ==UserScript==
+ // @name         Quark Alien - Rainbow Ball Shatter
+ // @namespace    quark-alien
+ // @version      2.0.0
+ // @description  Ctrl+0 -> Ziel auswählen -> Regenbogenball und Splitterexplosion
+ // @match        *://*/*
+ // @run-at       document-start
+ // @grant        none
+ // ==/UserScript==
+
+ (() => {
+    'use strict';
+
+    let selecting = false;
+    let hovered = null;
+    let canvas = null;
+    let ctx = null;
+    let animationFrame = 0;
+    let cleanup = [];
+    let lastTarget = null;
+
+    const $ = (tag, styles = {}) => {
+        const el = document.createElement(tag);
+        Object.assign(el.style, styles);
+        return el;
+    };
+
+    function addStyle() {
+        if (document.getElementById('qa-shatter-style')) return;
+        const s = document.createElement('style');
+        s.id = 'qa-shatter-style';
+        s.textContent = `
+            .qa-target-hover {
+                outline: 2px dashed #ff1744 !important;
+                cursor: crosshair !important;
+            }
+            #qa-notice {
+                position: fixed !important;
+                top: 14px !important;
+                left: 50% !important;
+                transform: translateX(-50%) !important;
+                z-index: 2147483647 !important;
+                background: #111 !important;
+                color: white !important;
+                padding: 10px 16px !important;
+                border: 2px solid #ff1744 !important;
+                border-radius: 5px !important;
+                font: 14px monospace !important;
+                pointer-events: none !important;
+            }
+            .qa-shard {
+                position: fixed !important;
+                margin: 0 !important;
+                pointer-events: none !important;
+                transform-origin: center center !important;
+                will-change: transform, opacity, clip-path !important;
+            }
+            .qa-ball {
+                position: fixed !important;
+                z-index: 2147483646 !important;
+                border-radius: 50% !important;
+                background: conic-gradient(
+                    red, yellow, lime, cyan, blue, magenta, red
+                ) !important;
+                box-shadow:
+                    0 0 8px white,
+                    0 0 20px #ff00de,
+                    0 0 36px #00eaff !important;
+                pointer-events: none !important;
+                will-change: left, top, transform, filter !important;
+            }
+        `;
+        (document.head || document.documentElement).appendChild(s);
+    }
+
+    function notice(text) {
+        let n = document.getElementById('qa-notice');
+        if (!n) {
+            n = $('div');
+            n.id = 'qa-notice';
+            (document.body || document.documentElement).appendChild(n);
+        }
+        n.textContent = text;
+    }
+
+    function clearNotice() {
+        document.getElementById('qa-notice')?.remove();
+    }
+
+    function startSelect() {
+        addStyle();
+        selecting = true;
+        notice('QUARK ALIEN // Element anklicken · ESC = Abbrechen');
+
+        document.addEventListener('mousemove', move, true);
+        document.addEventListener('click', choose, true);
+        document.addEventListener('keydown', cancelKey, true);
+    }
+
+    function stopSelect() {
+        selecting = false;
+        hovered?.classList.remove('qa-target-hover');
+        hovered = null;
+        clearNotice();
+        document.removeEventListener('mousemove', move, true);
+        document.removeEventListener('click', choose, true);
+        document.removeEventListener('keydown', cancelKey, true);
+    }
+
+    function move(e) {
+        if (!selecting) return;
+        const el = document.elementFromPoint(e.clientX, e.clientY);
+        if (!el || el === document.body || el === document.documentElement ||
+            el.closest('#qa-notice') || el === hovered) return;
+
+        hovered?.classList.remove('qa-target-hover');
+        hovered = el;
+        hovered.classList.add('qa-target-hover');
+    }
+
+    function cancelKey(e) {
+        if (e.key === 'Escape') {
+            e.preventDefault();
+            stopSelect();
+        }
+    }
+
+    function choose(e) {
+        if (!selecting) return;
+        const target = document.elementFromPoint(e.clientX, e.clientY);
+
+        if (!target || target === document.body ||
+            target === document.documentElement ||
+            target.closest('#qa-notice')) return;
+
+        e.preventDefault();
+        e.stopPropagation();
+        e.stopImmediatePropagation();
+
+        const rect = target.getBoundingClientRect();
+        if (rect.width < 5 || rect.height < 5) {
+            stopSelect();
+            return;
+        }
+
+        stopSelect();
+        shatter(target, rect);
+    }
+
+    function makeCanvas() {
+        canvas?.remove();
+        canvas = $('canvas', {
+            position: 'fixed',
+            inset: '0',
+            width: '100vw',
+            height: '100vh',
+            zIndex: '2147483645',
+            pointerEvents: 'none'
+        });
+        document.documentElement.appendChild(canvas);
+
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        canvas.width = innerWidth * dpr;
+        canvas.height = innerHeight * dpr;
+        ctx = canvas.getContext('2d');
+        ctx.scale(dpr, dpr);
+    }
+
+    function rand(a, b) {
+        return a + Math.random() * (b - a);
+    }
+
+    function addCleanup(fn) {
+        cleanup.push(fn);
+    }
+
+    function clearEffects() {
+        cancelAnimationFrame(animationFrame);
+        cleanup.forEach(fn => {
+            try { fn(); } catch (_) {}
+        });
+        cleanup = [];
+        canvas?.remove();
+        canvas = null;
+        ctx = null;
+    }
+
+    function drawExplosion(x, y, progress, rays) {
+        if (!ctx) return;
+        ctx.clearRect(0, 0, innerWidth, innerHeight);
+
+        for (const r of rays) {
+            const p = Math.max(0, Math.min(1, (progress - r.delay) /
+                (1 - r.delay)));
+            if (p <= 0) continue;
+
+            const len = r.len * (1 - Math.pow(1 - p, 2));
+            const alpha = Math.max(0, 1 - progress);
+
+            ctx.beginPath();
+            ctx.moveTo(x + Math.cos(r.a) * 3, y + Math.sin(r.a) * 3);
+            ctx.lineTo(x + Math.cos(r.a) * len, y + Math.sin(r.a) * len);
+            ctx.strokeStyle = `hsla(${r.hue},100%,55%,${alpha})`;
+            ctx.lineWidth = r.width;
+            ctx.lineCap = 'round';
+            ctx.stroke();
+        }
+    }
+
+    function makeRays() {
+        return Array.from({ length: 340 }, () => ({
+            a: rand(0, Math.PI * 2),
+            len: rand(70, Math.min(380, Math.max(150, innerWidth * .55))),
+            hue: rand(0, 360),
+            width: rand(.5, 1.6),
+            delay: rand(0, .16)
+        }));
+    }
+
+    // Dreiecksfragmente: jeder Klon zeigt nur einen Teil des Elements.
+    function makeShards(target, rect) {
+        const count = Math.min(34, Math.max(18,
+            Math.round((rect.width * rect.height) / 1800)));
+
+        const shards = [];
+        const w = rect.width;
+        const h = rect.height;
+
+        for (let i = 0; i < count; i++) {
+            const clone = target.cloneNode(true);
+
+            // Verhindert doppelte IDs und unerwünschte aktive Inhalte.
+            clone.removeAttribute?.('id');
+            clone.querySelectorAll?.('[id]').forEach(n => n.removeAttribute('id'));
+            clone.querySelectorAll?.('script, iframe, video, audio').forEach(n => n.remove());
+
+            Object.assign(clone.style, {
+                position: 'fixed',
+                left: rect.left + 'px',
+                top: rect.top + 'px',
+                width: w + 'px',
+                height: h + 'px',
+                minWidth: '0',
+                minHeight: '0',
+                maxWidth: 'none',
+                maxHeight: 'none',
+                boxSizing: 'border-box',
+                margin: '0',
+                visibility: 'visible',
+                opacity: '1',
+                overflow: 'hidden',
+                zIndex: '2147483644',
+                pointerEvents: 'none'
+            });
+
+            clone.classList.remove('qa-target-hover');
+            clone.classList.add('qa-shard');
+
+            // Zufälliges Dreieck innerhalb der Elementfläche.
+            const pts = [
+                [rand(0, 100), rand(0, 100)],
+                [rand(0, 100), rand(0, 100)],
+                [rand(0, 100), rand(0, 100)]
+            ];
+
+            clone.style.clipPath = `polygon(${
+                pts.map(p => `${p[0]}% ${p[1]}%`).join(',')
+            })`;
+
+            document.documentElement.appendChild(clone);
+
+            shards.push({
+                el: clone,
+                dx: rand(-1, 1) * Math.max(100, innerWidth * .22),
+                dy: rand(-1, 1) * Math.max(100, innerHeight * .24) - rand(20, 100),
+                rot: rand(-600, 600),
+                scale: rand(.05, .5),
+                delay: rand(0, .12)
+            });
+
+            addCleanup(() => clone.remove());
+        }
+
+        return shards;
+    }
+
+    function shatter(target, rect) {
+        clearEffects();
+        addStyle();
+
+        const oldVisibility = target.style.visibility;
+        const oldPointerEvents = target.style.pointerEvents;
+
+        // Klone werden erzeugt, bevor das Original verborgen wird.
+        const shards = makeShards(target, rect);
+        target.style.visibility = 'hidden';
+        lastTarget = target;
+
+        addCleanup(() => {
+            // Absichtlich keine automatische Wiederherstellung des Originals.
+            // Ein Neuladen stellt die ursprüngliche Seite wieder her.
+            target.style.visibility = 'hidden';
+        });
+
+        const cx = rect.left + rect.width / 2;
+        const cy = rect.top + rect.height / 2;
+
+        const ball = $('div', {
+            width: '28px',
+            height: '28px',
+            left: '-40px',
+            top: '-40px',
+            filter: 'hue-rotate(0deg)',
+            transform: 'scale(1)'
+        });
+        ball.className = 'qa-ball';
+        document.documentElement.appendChild(ball);
+        addCleanup(() => ball.remove());
+
+        const startX = -35;
+        const startY = Math.max(35, Math.min(innerHeight - 35, cy + 100));
+        const endX = cx;
+        const endY = cy;
+
+        const start = performance.now();
+        const rollDuration = 1050;
+        const burstDuration = 1350;
+        const totalDuration = rollDuration + burstDuration;
+        const rays = makeRays();
+
+        makeCanvas();
+
+        function frame(now) {
+            const elapsed = now - start;
+            const rollP = Math.min(1, elapsed / rollDuration);
+            const eased = rollP * rollP * (3 - 2 * rollP);
+
+            const bx = startX + (endX - startX) * eased;
+            const by = startY + (endY - startY) * eased;
+
+            if (elapsed < rollDuration) {
+                ball.style.left = (bx - 14) + 'px';
+                ball.style.top = (by - 14) + 'px';
+                ball.style.transform =
+                    `rotate(${elapsed * .65}deg) scale(${1 + Math.sin(elapsed / 65) * .1})`;
+                ball.style.filter = `hue-rotate(${elapsed * .65}deg)`;
+            } else {
+                ball.style.opacity = '0';
+
+                const p = Math.min(1, (elapsed - rollDuration) / burstDuration);
+                drawExplosion(cx, cy, p, rays);
+
+                for (const s of shards) {
+                    const q = Math.max(0, Math.min(1,
+                        (p - s.delay) / (1 - s.delay)));
+
+                    const x = s.dx * q;
+                    const y = s.dy * q + 130 * q * q;
+                    const rotation = s.rot * q;
+                    const scale = 1 - (1 - s.scale) * q;
+
+                    s.el.style.transform =
+                        `translate(${x}px, ${y}px) rotate(${rotation}deg) scale(${scale})`;
+                    s.el.style.opacity = String(Math.max(0, 1 - q * .92));
+                }
+            }
+
+            if (elapsed < totalDuration) {
+                animationFrame = requestAnimationFrame(frame);
+            } else {
+                clearEffects();
+                // Original bleibt verborgen; Seite neu laden zum Zurücksetzen.
+            }
+        }
+
+        animationFrame = requestAnimationFrame(frame);
+    }
+
+    document.addEventListener('keydown', e => {
+        if (e.ctrlKey && !e.altKey && !e.metaKey && e.key === '0') {
+            e.preventDefault();
+            e.stopPropagation();
+            e.stopImmediatePropagation();
+
+            if (selecting) stopSelect();
+            else startSelect();
+        }
+    }, true);
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', addStyle, { once: true });
+    } else {
+        addStyle();
+    }
+ })();
